@@ -266,12 +266,18 @@ extern "C" {
 }
 
 impl FsEventWatcher {
-    fn from_event_handler(event_handler: Arc<Mutex<dyn EventHandler>>) -> Result<Self> {
+    fn from_event_handler(
+        event_handler: Arc<Mutex<dyn EventHandler>>,
+        config: Config,
+    ) -> Result<Self> {
         Ok(FsEventWatcher {
             paths: unsafe {
                 cf::CFArrayCreateMutable(cf::kCFAllocatorDefault, 0, &cf::kCFTypeArrayCallBacks)
             },
-            since_when: fs::kFSEventStreamEventIdSinceNow,
+            since_when: config
+                .event_id()
+                .filter(|&x| x > 0)
+                .unwrap_or(fs::kFSEventStreamEventIdSinceNow),
             latency: 0.0,
             flags: fs::kFSEventStreamCreateFlagFileEvents | fs::kFSEventStreamCreateFlagNoDefer,
             event_handler,
@@ -492,7 +498,7 @@ extern "C" fn callback(
 }
 
 unsafe fn callback_impl(
-    _stream_ref: fs::FSEventStreamRef,
+    stream_ref: fs::FSEventStreamRef,
     info: *mut libc::c_void,
     num_events: libc::size_t,                        // size_t numEvents
     event_paths: *mut libc::c_void,                  // void *eventPaths
@@ -502,6 +508,7 @@ unsafe fn callback_impl(
     let event_paths = event_paths as *const *const libc::c_char;
     let info = info as *const StreamContextInfo;
     let event_handler = &(*info).event_handler;
+    let event_id = fs::FSEventStreamGetLatestEventId(stream_ref);
 
     for p in 0..num_events {
         let path = CStr::from_ptr(*event_paths.add(p))
@@ -537,7 +544,7 @@ unsafe fn callback_impl(
 
         for ev in translate_flags(flag, true).into_iter() {
             // TODO: precise
-            let ev = ev.add_path(path.clone());
+            let ev = ev.add_path(path.clone()).set_event_id(event_id);
             let mut event_handler = event_handler.lock().expect("lock not to be poisoned");
             event_handler.handle_event(Ok(ev));
         }
@@ -546,8 +553,8 @@ unsafe fn callback_impl(
 
 impl Watcher for FsEventWatcher {
     /// Create a new watcher.
-    fn new<F: EventHandler>(event_handler: F, _config: Config) -> Result<Self> {
-        Self::from_event_handler(Arc::new(Mutex::new(event_handler)))
+    fn new<F: EventHandler>(event_handler: F, config: Config) -> Result<Self> {
+        Self::from_event_handler(Arc::new(Mutex::new(event_handler)), config)
     }
 
     fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {

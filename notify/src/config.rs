@@ -42,6 +42,9 @@ pub struct Config {
 
     /// See [BackendConfig::with_compare_contents]
     compare_contents: bool,
+
+    /// See [BackendConfig::with_event_id]
+    event_id: Option<u64>,
 }
 
 impl Config {
@@ -51,7 +54,7 @@ impl Config {
     /// file trees so it is recommended to measure and tune accordingly.
     ///
     /// The default poll frequency is 30 seconds.
-    /// 
+    ///
     /// This will enable automatic polling, overwriting [with_manual_polling](Config::with_manual_polling).
     pub fn with_poll_interval(mut self, dur: Duration) -> Self {
         // TODO: v7.0 break signature to option
@@ -76,9 +79,9 @@ impl Config {
     }
 
     /// For the [PollWatcher](crate::PollWatcher) backend.
-    /// 
+    ///
     /// Disable automatic polling. Requires calling [crate::PollWatcher::poll] manually.
-    /// 
+    ///
     /// This will disable automatic polling, overwriting [with_poll_interval](Config::with_poll_interval).
     pub fn with_manual_polling(mut self) -> Self {
         self.poll_interval = None;
@@ -104,6 +107,19 @@ impl Config {
     pub fn compare_contents(&self) -> bool {
         self.compare_contents
     }
+
+    /// For the [FsEventWatcher](crate::FsEventWatcher) backend.
+    ///
+    /// Supply events that have happened after the given event ID.
+    pub fn with_event_id(mut self, event_id: Option<u64>) -> Self {
+        self.event_id = event_id;
+        self
+    }
+
+    /// Returns current setting
+    pub fn event_id(&self) -> Option<u64> {
+        self.event_id
+    }
 }
 
 impl Default for Config {
@@ -111,6 +127,7 @@ impl Default for Config {
         Self {
             poll_interval: Some(Duration::from_secs(30)),
             compare_contents: false,
+            event_id: None,
         }
     }
 }

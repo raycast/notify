@@ -413,6 +413,16 @@ struct EventAttributesInner {
         serde(default, skip_serializing, skip_deserializing)
     )]
     process_id: Option<u32>,
+
+    /// The latest ID of the event – useful for starting supporting backends from this event.
+    ///
+    /// This attribute is experimental and, while included in Notify itself, is not considered
+    /// stable or standard enough to be part of the serde, eq, hash, and debug representations.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing, skip_deserializing)
+    )]
+    event_id: Option<u64>,
 }
 
 impl EventAttributes {
@@ -451,6 +461,14 @@ impl EventAttributes {
         self.inner.as_ref().and_then(|inner| inner.process_id)
     }
 
+    /// The ID of the event.
+    ///
+    /// This attribute is experimental and, while included in Notify itself, is not considered
+    /// stable or standard enough to be part of the serde, eq, hash, and debug representations.
+    pub fn event_id(&self) -> Option<u64> {
+        self.inner.as_ref().and_then(|inner| inner.event_id)
+    }
+
     /// Sets the tracker.
     pub fn set_tracker(&mut self, tracker: usize) {
         self.inner_mut().tracker = Some(tracker);
@@ -469,6 +487,11 @@ impl EventAttributes {
     /// Sets the process id onto the event.
     pub fn set_process_id(&mut self, process_id: u32) {
         self.inner_mut().process_id = Some(process_id)
+    }
+
+    /// Sets the event id onto the event.
+    pub fn set_event_id(&mut self, event_id: u64) {
+        self.inner_mut().event_id = Some(event_id)
     }
 
     fn inner_mut(&mut self) -> &mut EventAttributesInner {
@@ -573,6 +596,12 @@ impl Event {
     /// Sets the process id onto the event.
     pub fn set_process_id(mut self, process_id: u32) -> Self {
         self.attrs.set_process_id(process_id);
+        self
+    }
+
+    /// Sets the event id onto the event.
+    pub fn set_event_id(mut self, event_id: u64) -> Self {
+        self.attrs.set_event_id(event_id);
         self
     }
 }
