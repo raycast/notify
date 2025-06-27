@@ -304,7 +304,7 @@ fn start_read(rd: &ReadData, event_handler: Arc<Mutex<dyn EventHandler>>, handle
             // over to `ReadDirectoryChangesW`.
             // So we can claim ownership back.
             let _overlapped_alloc = std::mem::ManuallyDrop::into_inner(overlapped);
-            let request: Box<ReadDirectoryRequest> = mem::transmute(request_p);
+            let request: Box<ReadDirectoryRequest> = Box::from_raw(request_p as *mut ReadDirectoryRequest);
             ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
         }
     }
@@ -469,7 +469,7 @@ impl ReadDirectoryChangesWatcher {
                 pb, ack_pb
             )))
         } else {
-            Ok(())
+        Ok(())
         }
     }
 
