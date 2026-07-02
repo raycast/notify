@@ -20,7 +20,8 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_OPERATION_ABORTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED, ERROR_SUCCESS, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
@@ -36,7 +37,11 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::IO::{CancelIo, OVERLAPPED};
 
-const BUF_SIZE: u32 = 16384;
+// Also sizes the kernel-side buffer where changes accumulate between reads; once that
+// overflows, every buffered event is lost and the completion only reports that a rescan
+// is needed (see `handle_event`). 64 KiB is the largest size that still works for
+// directories watched over a network.
+const BUF_SIZE: u32 = 65536;
 
 #[derive(Clone)]
 struct ReadData {
@@ -303,8 +308,19 @@ fn start_read(rd: &ReadData, event_handler: Arc<Mutex<dyn EventHandler>>, handle
             // Because of the error, ownership of the `overlapped` alloc was not passed
             // over to `ReadDirectoryChangesW`.
             // So we can claim ownership back.
+            let os_error = std::io::Error::last_os_error();
             let _overlapped_alloc = std::mem::ManuallyDrop::into_inner(overlapped);
             let request: Box<ReadDirectoryRequest> = Box::from_raw(request_p as *mut ReadDirectoryRequest);
+            // Without a queued read this watch is dead: surface the failure so the
+            // consumer learns events stopped flowing instead of a silent stop.
+            let path = request
+                .data
+                .file
+                .clone()
+                .unwrap_or_else(|| request.data.dir.clone());
+            if let Ok(mut guard) = request.event_handler.lock() {
+                guard.handle_event(Err(Error::io(os_error).add_path(path)));
+            }
             ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
         }
     }
@@ -312,21 +328,81 @@ fn start_read(rd: &ReadData, event_handler: Arc<Mutex<dyn EventHandler>>, handle
 
 unsafe extern "system" fn handle_event(
     error_code: u32,
-    _bytes_written: u32,
+    bytes_written: u32,
     overlapped: *mut OVERLAPPED,
 ) {
     let overlapped: Box<OVERLAPPED> = Box::from_raw(overlapped);
     let request: Box<ReadDirectoryRequest> = Box::from_raw(overlapped.hEvent as *mut _);
 
-    if error_code == ERROR_OPERATION_ABORTED {
-        // received when dir is unwatched or watcher is shutdown; return and let overlapped/request
-        // get drop-cleaned
-        ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
-        return;
+    fn emit_event(event_handler: &Mutex<dyn EventHandler>, res: Result<Event>) {
+        if let Ok(mut guard) = event_handler.lock() {
+            let f: &mut dyn EventHandler = &mut *guard;
+            f.handle_event(res);
+        }
+    }
+
+    match error_code {
+        ERROR_SUCCESS => {}
+        ERROR_OPERATION_ABORTED => {
+            // received when dir is unwatched or watcher is shutdown; return and let
+            // overlapped/request get drop-cleaned
+            ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+            return;
+        }
+        // The watch handle was invalidated because the watched directory itself was
+        // deleted (plain permission revocation keeps the directory visible and falls
+        // through to the arm below). Report the removal for directory watches so
+        // consumers can reconcile; a watched file's own FILE_ACTION_REMOVED arrives
+        // through the parent-directory watch. No re-arm: reads on the dead handle can
+        // only fail.
+        ERROR_ACCESS_DENIED if matches!(request.data.dir.try_exists(), Ok(false)) => {
+            if request.data.file.is_none() {
+                let ev = Event::new(EventKind::Remove(RemoveKind::Folder))
+                    .add_path(request.data.dir.clone());
+                emit_event(&request.event_handler, Ok(ev));
+            }
+            ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+            return;
+        }
+        // Any other failure means this watch stopped delivering events (e.g. the handle
+        // went bad while the directory still exists). Surface it instead of dying
+        // silently; the buffer contents are not valid on a failed completion, so do not
+        // parse or re-arm.
+        _ => {
+            let path = request
+                .data
+                .file
+                .clone()
+                .unwrap_or_else(|| request.data.dir.clone());
+            let err =
+                Error::io(std::io::Error::from_raw_os_error(error_code as i32)).add_path(path);
+            emit_event(&request.event_handler, Err(err));
+            ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+            return;
+        }
     }
 
     // Get the next request queued up as soon as possible
     start_read(&request.data, request.event_handler.clone(), request.handle);
+
+    // A successful completion with zero bytes means the kernel-side change buffer
+    // overflowed before this read drained it: the OS discarded every event in that
+    // window and asks us to rescan ourselves. Emit a rescan-flagged event carrying the
+    // watch target so consumers can reconcile — deletions in the dropped window would
+    // otherwise never be observed. (FSEvents and inotify report the same condition as
+    // MustScanSubDirs / Q_OVERFLOW, which notify also maps to `Flag::Rescan`.)
+    if bytes_written == 0 {
+        let path = request
+            .data
+            .file
+            .clone()
+            .unwrap_or_else(|| request.data.dir.clone());
+        let ev = Event::new(EventKind::Other)
+            .set_flag(Flag::Rescan)
+            .add_path(path);
+        emit_event(&request.event_handler, Ok(ev));
+        return;
+    }
 
     // The FILE_NOTIFY_INFORMATION struct has a variable length due to the variable length
     // string as its last member. Each struct contains an offset for getting the next entry in
@@ -358,13 +434,6 @@ unsafe extern "system" fn handle_event(
             );
 
             let newe = Event::new(EventKind::Any).add_path(path);
-
-            fn emit_event(event_handler: &Mutex<dyn EventHandler>, res: Result<Event>) {
-                if let Ok(mut guard) = event_handler.lock() {
-                    let f: &mut dyn EventHandler = &mut *guard;
-                    f.handle_event(res);
-                }
-            }
 
             let event_handler = |res| emit_event(&request.event_handler, res);
 
@@ -546,3 +615,151 @@ impl Drop for ReadDirectoryChangesWatcher {
 unsafe impl Send for ReadDirectoryChangesWatcher {}
 // Because all public methods are `&mut self` it's also perfectly safe to share references.
 unsafe impl Sync for ReadDirectoryChangesWatcher {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn recv_matching(
+        rx: &mpsc::Receiver<Result<Event>>,
+        timeout: Duration,
+        pred: impl Fn(&Result<Event>) -> bool,
+    ) -> Option<Result<Event>> {
+        let deadline = Instant::now() + timeout;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(remaining) {
+                Ok(res) if pred(&res) => return Some(res),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn create_and_remove_events_are_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = ReadDirectoryChangesWatcher::new(
+            move |res: Result<Event>| {
+                let _ = tx.send(res);
+            },
+            Config::default(),
+        )
+        .unwrap();
+        watcher.watch(dir.path(), RecursiveMode::Recursive).unwrap();
+
+        let file = dir.path().join("a.txt");
+        fs::write(&file, b"x").unwrap();
+        assert!(
+            recv_matching(&rx, Duration::from_secs(10), |res| matches!(
+                res,
+                Ok(ev) if matches!(ev.kind, EventKind::Create(_)) && ev.paths.contains(&file)
+            ))
+            .is_some(),
+            "expected a Create event for {file:?}"
+        );
+
+        fs::remove_file(&file).unwrap();
+        assert!(
+            recv_matching(&rx, Duration::from_secs(10), |res| matches!(
+                res,
+                Ok(ev) if matches!(ev.kind, EventKind::Remove(_)) && ev.paths.contains(&file)
+            ))
+            .is_some(),
+            "expected a Remove event for {file:?}"
+        );
+    }
+
+    // The kernel accumulates changes for a watch in a BUF_SIZE-byte buffer between reads;
+    // when it overflows, the read completes with zero bytes and every buffered event is
+    // lost. Guards the fix: that condition must surface as a `Flag::Rescan` event carrying
+    // the watch root — previously it was silently swallowed, so consumers (e.g. a file
+    // index) never learned that deletions were dropped.
+    #[test]
+    fn buffer_overflow_emits_rescan_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let gate = Arc::new(AtomicBool::new(false));
+        let blocked = Arc::new(AtomicBool::new(false));
+        let handler_gate = gate.clone();
+        let handler_blocked = blocked.clone();
+
+        let mut watcher = ReadDirectoryChangesWatcher::new(
+            move |res: Result<Event>| {
+                // Park the completion-routine thread on the first event so the kernel
+                // buffer fills (and overflows) behind it.
+                if !handler_blocked.swap(true, Ordering::SeqCst) {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !handler_gate.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                let _ = tx.send(res);
+            },
+            Config::default(),
+        )
+        .unwrap();
+        watcher.watch(dir.path(), RecursiveMode::Recursive).unwrap();
+
+        // First change parks the handler...
+        fs::write(dir.path().join("gate-opener"), b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !blocked.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "watcher never delivered the first event");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // ...then generate far more change records than BUF_SIZE can hold.
+        for i in 0..8000 {
+            let path = dir
+                .path()
+                .join(format!("overflow-file-{i:05}-padding-padding-padding.tmp"));
+            fs::write(&path, b"").unwrap();
+        }
+        gate.store(true, Ordering::SeqCst);
+
+        let rescan = recv_matching(&rx, Duration::from_secs(30), |res| {
+            matches!(res, Ok(ev) if ev.need_rescan())
+        })
+        .expect("kernel buffer overflow must surface as a rescan event");
+        let rescan = rescan.unwrap();
+        assert_eq!(rescan.kind, EventKind::Other);
+        assert_eq!(rescan.paths, vec![dir.path().to_path_buf()]);
+    }
+
+    // Deleting the watched directory itself invalidates the watch handle. Guards against
+    // the watch dying silently: the consumer must observe either a Remove event for the
+    // root (handle already invalidated) or an error — anything but silence.
+    #[test]
+    fn deleting_watched_directory_is_surfaced() {
+        let parent = tempfile::tempdir().unwrap();
+        let watched = parent.path().join("watched");
+        fs::create_dir(&watched).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = ReadDirectoryChangesWatcher::new(
+            move |res: Result<Event>| {
+                let _ = tx.send(res);
+            },
+            Config::default(),
+        )
+        .unwrap();
+        watcher.watch(&watched, RecursiveMode::Recursive).unwrap();
+
+        fs::remove_dir_all(&watched).unwrap();
+
+        let surfaced = recv_matching(&rx, Duration::from_secs(10), |res| match res {
+            Ok(ev) => matches!(ev.kind, EventKind::Remove(_)) && ev.paths.contains(&watched),
+            Err(_) => true,
+        });
+        assert!(
+            surfaced.is_some(),
+            "deleting the watched directory must surface a Remove event or an error, not silence"
+        );
+    }
+}
