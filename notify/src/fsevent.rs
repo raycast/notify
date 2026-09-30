@@ -388,9 +388,12 @@ impl FsEventWatcher {
         event_handler: Arc<Mutex<dyn EventHandler>>,
         event_kinds: EventKindMask,
         latency: cf::CFTimeInterval,
+        event_id: Option<u64>,
     ) -> Result<Self> {
         Ok(FsEventWatcher {
-            since_when: fs::kFSEventStreamEventIdSinceNow,
+            since_when: event_id
+                .filter(|&id| id > 0)
+                .unwrap_or(fs::kFSEventStreamEventIdSinceNow),
             latency,
             flags: fs::kFSEventStreamCreateFlagFileEvents
                 | fs::kFSEventStreamCreateFlagNoDefer
@@ -770,7 +773,7 @@ unsafe fn callback_impl(
     num_events: libc::size_t,                          // size_t numEvents
     event_paths: NonNull<libc::c_void>,                // void *eventPaths
     event_flags: NonNull<fs::FSEventStreamEventFlags>, // const FSEventStreamEventFlags eventFlags[]
-    _event_ids: NonNull<fs::FSEventStreamEventId>,     // const FSEventStreamEventId eventIds[]
+    event_ids: NonNull<fs::FSEventStreamEventId>,      // const FSEventStreamEventId eventIds[]
 ) {
     let event_paths = event_paths.as_ptr() as *const *const libc::c_char;
     let info = info as *const StreamContextInfo;
@@ -784,6 +787,7 @@ unsafe fn callback_impl(
         let path = Path::new(OsStr::from_bytes(path.to_bytes()));
 
         let raw_flag = *event_flags.as_ptr().add(p) as u32;
+        let event_id = *event_ids.as_ptr().add(p);
         let flag = StreamFlags::from_bits_truncate(raw_flag);
         let unknown_bits = raw_flag & !StreamFlags::all().bits();
         if unknown_bits != 0 {
@@ -839,6 +843,7 @@ unsafe fn callback_impl(
             if !event_kinds.matches(&ev.kind) {
                 return;
             }
+            ev.attrs.set_event_id(event_id);
             if single_translated_event {
                 ev.paths
                     .push(event_path.take().expect("single translated event path"));
@@ -871,6 +876,7 @@ impl Watcher for FsEventWatcher {
             Arc::new(Mutex::new(event_handler)),
             config.event_kinds(),
             config.fsevent_latency().as_secs_f64(),
+            config.event_id(),
         )
     }
 
@@ -1356,6 +1362,47 @@ mod tests {
         assert!(res.is_ok(), "callback_impl should not panic");
 
         rx.try_iter().collect()
+    }
+
+    #[test]
+    fn callback_impl_stamps_each_event_with_its_own_id() {
+        let mut recursive_info = HashMap::new();
+        recursive_info.insert(
+            PathBuf::from("/tmp"),
+            WatchInfo {
+                is_recursive: true,
+                reported_path: PathBuf::from("/tmp"),
+            },
+        );
+
+        let events = run_callback(
+            recursive_info,
+            &[
+                (b"/tmp/a".as_slice(), StreamFlags::ITEM_CREATED.bits()),
+                (b"/tmp/b".as_slice(), StreamFlags::ITEM_CREATED.bits()),
+            ],
+        );
+
+        let ids: Vec<_> = events
+            .iter()
+            .map(|event| event.as_ref().expect("expected Ok(Event)").attrs.event_id())
+            .collect();
+        assert_eq!(ids, [Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn stream_starts_from_the_configured_event_id() {
+        let start = |event_id| {
+            FsEventWatcher::new(
+                |_: Result<Event>| {},
+                Config::default().with_event_id(event_id),
+            )
+            .expect("watcher")
+            .since_when
+        };
+        assert_eq!(start(Some(42)), 42);
+        assert_eq!(start(Some(0)), fs::kFSEventStreamEventIdSinceNow);
+        assert_eq!(start(None), fs::kFSEventStreamEventIdSinceNow);
     }
 
     #[test]

@@ -76,6 +76,9 @@ pub struct Config {
 
     /// See [Config::with_fsevent_latency]
     fsevent_latency: Duration,
+
+    /// See [Config::with_event_id]
+    event_id: Option<u64>,
 }
 
 impl Config {
@@ -235,6 +238,25 @@ impl Config {
     pub fn fsevent_latency(&self) -> Duration {
         self.fsevent_latency
     }
+
+    /// For the [`FsEventWatcher`](crate::FsEventWatcher) backend.
+    ///
+    /// Deliver the events that happened after this event ID (see `EventAttributes::event_id`)
+    /// before live ones, so a consumer that persists the last ID it handled can resume across
+    /// restarts without missing changes. `None` or `0` starts from now, the default.
+    ///
+    /// This can't be changed during runtime.
+    #[must_use]
+    pub fn with_event_id(mut self, event_id: Option<u64>) -> Self {
+        self.event_id = event_id;
+        self
+    }
+
+    /// Returns current setting
+    #[must_use]
+    pub fn event_id(&self) -> Option<u64> {
+        self.event_id
+    }
 }
 
 impl Default for Config {
@@ -246,6 +268,7 @@ impl Default for Config {
             event_kinds: EventKindMask::ALL,
             windows_path_separator_style: WindowsPathSeparatorStyle::Auto,
             fsevent_latency: Duration::ZERO,
+            event_id: None,
         }
     }
 }
