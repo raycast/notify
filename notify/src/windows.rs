@@ -39,7 +39,9 @@ use windows_sys::Win32::System::Threading::{
     CreateSemaphoreW, INFINITE, ReleaseSemaphore, WaitForSingleObjectEx,
 };
 
-const BUF_SIZE: u32 = 16384;
+// The largest buffer ReadDirectoryChangesW accepts for network paths. At 16 KiB a burst such as a
+// mass deletion routinely overflowed it, turning every such burst into a rescan.
+const BUF_SIZE: u32 = 65536;
 
 #[derive(Clone, Copy)]
 enum SeparatorStyle {
@@ -596,6 +598,11 @@ unsafe extern "system" fn handle_event(
                 request.data.dir.display(),
                 error_code
             );
+            // Also tell the handler: the watch ends here, and a consumer that only listens to
+            // events would otherwise never learn that it stopped.
+            let err = Error::io(std::io::Error::from_raw_os_error(error_code as i32))
+                .add_path(request.data.dir.clone());
+            emit_event(&request.event_handler, Err(err));
             request.unwatch();
             ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
             return;
@@ -613,7 +620,15 @@ unsafe extern "system" fn handle_event(
     .err();
 
     if let Some(event) = completion_rescan_event(error_code, bytes_written) {
-        emit_event(&request.event_handler, Ok(event));
+        // Carry the watch target, as the FSEvents and inotify rescans do, so a consumer can rescan
+        // what this watch covers rather than everything it watches.
+        let path = request.data.file.clone().unwrap_or_else(|| {
+            normalize_path_separators(
+                request.data.reported_dir.clone(),
+                request.data.separator_style,
+            )
+        });
+        emit_event(&request.event_handler, Ok(event.add_path(path)));
 
         // Lost event details and a failed rearm are separate conditions. Report both so callers
         // know to rebuild their state and that this watch is no longer active.
