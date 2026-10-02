@@ -227,12 +227,18 @@ fn translate_flags_with(flags: StreamFlags, precise: bool, mut emit: impl FnMut(
     // however documentation on what those mean is scant, so we just pass them
     // through in the info attr field. The intent is clear enough, and the
     // additional information is provided if the user wants it.
+    //
+    // A kernel drop wins when both are set. A user drop only means this client
+    // fell behind, so the events are still in fseventsd's history and a stream
+    // restarted from an earlier event id replays them; a kernel drop can mean
+    // they never reached the history at all. Reporting a mixed drop as a user
+    // drop would invite a caller to replay history that is missing events.
     if flags.contains(StreamFlags::MUST_SCAN_SUBDIRS) {
         let e = Event::new(EventKind::Other).set_flag(Flag::Rescan);
-        emit_event(if flags.contains(StreamFlags::USER_DROPPED) {
-            e.set_info("rescan: user dropped")
-        } else if flags.contains(StreamFlags::KERNEL_DROPPED) {
+        emit_event(if flags.contains(StreamFlags::KERNEL_DROPPED) {
             e.set_info("rescan: kernel dropped")
+        } else if flags.contains(StreamFlags::USER_DROPPED) {
+            e.set_info("rescan: user dropped")
         } else {
             e
         });
@@ -1470,6 +1476,30 @@ mod tests {
             event.kind.is_create(),
             "expected create event, got {event:?}"
         );
+    }
+
+    #[test]
+    fn translate_flags_reports_a_kernel_drop_over_a_user_drop() {
+        let info = |flags: StreamFlags| {
+            let events = translate_flags(flags | StreamFlags::MUST_SCAN_SUBDIRS, true);
+            assert_eq!(events.len(), 1, "expected one rescan event, got {events:?}");
+            assert!(events[0].need_rescan());
+            events[0].info().map(str::to_owned)
+        };
+        assert_eq!(
+            info(StreamFlags::USER_DROPPED).as_deref(),
+            Some("rescan: user dropped")
+        );
+        assert_eq!(
+            info(StreamFlags::KERNEL_DROPPED).as_deref(),
+            Some("rescan: kernel dropped")
+        );
+        assert_eq!(
+            info(StreamFlags::USER_DROPPED | StreamFlags::KERNEL_DROPPED).as_deref(),
+            Some("rescan: kernel dropped"),
+            "a mixed drop may be missing from history, so it must not read as a user drop"
+        );
+        assert_eq!(info(StreamFlags::empty()), None);
     }
 
     #[test]
